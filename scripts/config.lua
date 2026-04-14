@@ -6,14 +6,14 @@ return {
     -- ==================== LLM 大语言模型 ====================
     LLM = {
         API_URL    = "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
-        API_KEY    = "YOUR_API_KEY_HERE",
-        MODEL      = "YOUR_MODEL_ID_HERE",
+        API_KEY    = "44738533-488b-49a2-86a2-5d5f06968699",
+        MODEL      = "ep-20260413224319-t7qkj",
         MAX_TOKENS = 512,
     },
 
     -- ==================== TTS 语音合成 ====================
     TTS = {
-        ENABLED  = true,
+        ENABLED  = false,
         API_URL  = "https://openspeech.bytedance.com/api/v1/tts",
         API_KEY  = "YOUR_TTS_API_KEY_HERE",
         VOICE    = "zh_female_cancan",
@@ -22,7 +22,7 @@ return {
 
     -- ==================== ASR 语音识别 ====================
     ASR = {
-        ENABLED  = true,
+        ENABLED  = false,
         API_URL  = "https://openspeech.bytedance.com/api/v1/asr",
         API_KEY  = "YOUR_ASR_API_KEY_HERE",
     },

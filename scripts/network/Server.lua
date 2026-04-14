@@ -1,6 +1,9 @@
+---@diagnostic disable: undefined-global
 -- ============================================================================
--- Server.lua — 服务端：LLM + TTS + ASR + 记忆持久化 + 主动说话 + 触摸 + 视觉
+-- Server.lua — 服务端：LLM + TTS + ASR + 对话记忆 + 主动说话 + 触摸 + 视觉
 -- ============================================================================
+-- 注意：服务端模式下 File API 完全屏蔽，对话历史仅在内存中维护。
+--       如需持久化，请使用 serverCloud API。
 
 local Config = require("config")
 
@@ -51,13 +54,18 @@ local function StripExpressionTag(text)
     return text:gsub("%s*%[%w+%]%s*$", "")
 end
 
--- ======================== 对话历史管理 ========================
+-- ======================== 对话历史管理（纯内存）========================
+-- 服务端模式下 File API 被完全屏蔽，因此不做文件持久化。
+-- 如需跨会话持久化，请改用 serverCloud API。
 
-local chatHistories = {}     -- { [connection] = { messages... } }
-local sessionIds    = {}     -- { [connection] = "session_id" }
-local lastActivity  = {}     -- { [connection] = timestamp }
-local proactiveSent = {}     -- { [connection] = timestamp }
-local interruptFlags = {}    -- { [connection] = true }
+local chatHistories  = {}     -- { [connection] = { messages... } }
+local sessionIds     = {}     -- { [connection] = "session_id" }
+local lastActivity   = {}     -- { [connection] = timestamp }
+local proactiveSent  = {}     -- { [connection] = timestamp }
+local interruptFlags = {}     -- { [connection] = true }
+
+-- 存储所有会话（内存中）
+local allSessions    = {}     -- { [sessionId] = { messages... } }
 
 local function GetHistory(connection)
     if not chatHistories[connection] then
@@ -78,11 +86,7 @@ local function AppendHistory(connection, role, content)
     end
 end
 
--- ======================== 持久化：SaveHistory / LoadHistory ========================
-
-local function EnsureDir(path)
-    os.execute('mkdir "' .. path:gsub("/", "\\") .. '" 2>nul')
-end
+-- ======================== 会话管理（内存版）========================
 
 local function GetSessionId(connection)
     if not sessionIds[connection] then
@@ -91,62 +95,34 @@ local function GetSessionId(connection)
     return sessionIds[connection]
 end
 
-local function GetHistoryPath(sessionId)
-    return Config.HISTORY.SAVE_DIR .. "/" .. sessionId .. ".json"
-end
-
-local function SaveHistory(connection)
+local function SaveSessionToMemory(connection)
     if not Config.HISTORY.AUTO_SAVE then return end
-
     local sid = GetSessionId(connection)
     local history = GetHistory(connection)
 
-    EnsureDir(Config.HISTORY.SAVE_DIR)
-
-    local data = cjson.encode({
-        session_id = sid,
-        updated_at = os.date("%Y-%m-%d %H:%M:%S"),
-        messages   = history,
-    })
-
-    local f = io.open(GetHistoryPath(sid), "w")
-    if f then
-        f:write(data)
-        f:close()
-        print("[Server] History saved: " .. sid)
-    else
-        print("[Server] Failed to save history: " .. sid)
+    -- 深拷贝到 allSessions
+    local copy = {}
+    for _, msg in ipairs(history) do
+        table.insert(copy, {
+            role      = msg.role,
+            content   = msg.content,
+            timestamp = msg.timestamp,
+        })
     end
+    allSessions[sid] = copy
+    print("[Server] Session saved to memory: " .. sid)
 end
 
-local function LoadHistory(sessionId)
-    local path = GetHistoryPath(sessionId)
-    local f = io.open(path, "r")
-    if not f then return nil end
-
-    local raw = f:read("*a")
-    f:close()
-
-    local ok, data = pcall(cjson.decode, raw)
-    if ok and data and data.messages then
-        return data.messages
-    end
-    return nil
+local function LoadSessionFromMemory(sessionId)
+    return allSessions[sessionId]
 end
 
-local function ListHistories()
+local function ListAllSessions()
     local list = {}
-    local dir = Config.HISTORY.SAVE_DIR
-    local handle = io.popen('dir /b "' .. dir:gsub("/", "\\") .. '" 2>nul')
-    if handle then
-        for line in handle:lines() do
-            local sid = line:match("^(.+)%.json$")
-            if sid then
-                table.insert(list, sid)
-            end
-        end
-        handle:close()
+    for sid, _ in pairs(allSessions) do
+        table.insert(list, sid)
     end
+    table.sort(list)
     return list
 end
 
@@ -210,7 +186,9 @@ local function CallLLM(connection, userText, imageBase64)
         max_tokens = config.MAX_TOKENS,
     })
 
-    connection:SendRemoteEvent(EVENTS.CHAT_TYPING, true, {})
+    -- 通知客户端：AI 正在思考
+    local typingData = VariantMap()
+    connection:SendRemoteEvent(EVENTS.CHAT_TYPING, true, typingData)
     interruptFlags[connection] = false
 
     http:Create()
@@ -227,18 +205,18 @@ local function CallLLM(connection, userText, imageBase64)
 
             if not response.success then
                 print("[Server] LLM HTTP failed: status=" .. tostring(response.statusCode))
-                connection:SendRemoteEvent(EVENTS.CHAT_ERROR, true, {
-                    error = "HTTP " .. tostring(response.statusCode),
-                })
+                local errData = VariantMap()
+                errData["error"] = Variant("HTTP " .. tostring(response.statusCode))
+                connection:SendRemoteEvent(EVENTS.CHAT_ERROR, true, errData)
                 return
             end
 
             local ok, data = pcall(cjson.decode, response.dataAsString)
             if not ok or not data.choices or #data.choices == 0 then
                 print("[Server] LLM response parse error")
-                connection:SendRemoteEvent(EVENTS.CHAT_ERROR, true, {
-                    error = "Invalid LLM response",
-                })
+                local errData = VariantMap()
+                errData["error"] = Variant("Invalid LLM response")
+                connection:SendRemoteEvent(EVENTS.CHAT_ERROR, true, errData)
                 return
             end
 
@@ -250,14 +228,14 @@ local function CallLLM(connection, userText, imageBase64)
                 AppendHistory(connection, "user", userText)
             end
             AppendHistory(connection, "assistant", cleanReply)
-            SaveHistory(connection)
+            SaveSessionToMemory(connection)
 
             print("[Server] AI reply: " .. cleanReply .. "  expr: " .. expression)
 
-            connection:SendRemoteEvent(EVENTS.CHAT_REPLY, true, {
-                text       = cleanReply,
-                expression = expression,
-            })
+            local replyData = VariantMap()
+            replyData["text"]       = Variant(cleanReply)
+            replyData["expression"] = Variant(expression)
+            connection:SendRemoteEvent(EVENTS.CHAT_REPLY, true, replyData)
 
             if Config.TTS.ENABLED then
                 CallTTS(connection, cleanReply)
@@ -265,9 +243,9 @@ local function CallLLM(connection, userText, imageBase64)
         end)
         :OnError(function(client, statusCode, error)
             print("[Server] LLM network error: " .. tostring(error))
-            connection:SendRemoteEvent(EVENTS.CHAT_ERROR, true, {
-                error = "Network error: " .. tostring(error),
-            })
+            local errData = VariantMap()
+            errData["error"] = Variant("Network error: " .. tostring(error))
+            connection:SendRemoteEvent(EVENTS.CHAT_ERROR, true, errData)
         end)
         :Send()
 end
@@ -309,10 +287,10 @@ function CallTTS(connection, text)
 
             local audioBase64 = data.audio or data.data or ""
             if #audioBase64 > 0 then
-                connection:SendRemoteEvent(EVENTS.AUDIO_PLAY, true, {
-                    audio  = audioBase64,
-                    format = Config.TTS.FORMAT,
-                })
+                local audioData = VariantMap()
+                audioData["audio"]  = Variant(audioBase64)
+                audioData["format"] = Variant(Config.TTS.FORMAT)
+                connection:SendRemoteEvent(EVENTS.AUDIO_PLAY, true, audioData)
                 print("[Server] TTS audio sent to client")
             end
         end)
@@ -354,9 +332,9 @@ local function CallASR(connection, audioBase64)
             local text = data.text or data.result or ""
             print("[Server] ASR result: " .. text)
 
-            connection:SendRemoteEvent(EVENTS.ASR_RESULT, true, {
-                text = text,
-            })
+            local asrData = VariantMap()
+            asrData["text"] = Variant(text)
+            connection:SendRemoteEvent(EVENTS.ASR_RESULT, true, asrData)
 
             if #text > 0 then
                 lastActivity[connection] = os.time()
@@ -400,10 +378,9 @@ end)
 -- 客户端握手
 SubscribeToEvent(EVENTS.CLIENT_READY, function(eventType, eventData)
     local connection = eventData["Connection"]:GetPtr("Connection")
-    connection.scene = scene_
     lastActivity[connection] = os.time()
     proactiveSent[connection] = os.time()
-    print("[Server] Client ready, scene assigned")
+    print("[Server] Client ready")
 end)
 
 -- 打断信号
@@ -417,7 +394,7 @@ SubscribeToEvent(EVENTS.INTERRUPT, function(eventType, eventData)
     end
     if #heardText > 0 then
         AppendHistory(connection, "system", "[用户打断了回复，已听到部分: " .. heardText .. "]")
-        SaveHistory(connection)
+        SaveSessionToMemory(connection)
     end
 
     lastActivity[connection] = os.time()
@@ -466,47 +443,55 @@ SubscribeToEvent(EVENTS.IMAGE_SEND, function(eventType, eventData)
     CallLLM(connection, userText, imageData)
 end)
 
--- 历史操作
+-- 加载历史会话
 SubscribeToEvent(EVENTS.HISTORY_LOAD, function(eventType, eventData)
     local connection = eventData["Connection"]:GetPtr("Connection")
     local sid = eventData["session_id"]:GetString()
 
-    local messages = LoadHistory(sid)
+    local messages = LoadSessionFromMemory(sid)
     if messages then
         chatHistories[connection] = messages
         sessionIds[connection] = sid
         print("[Server] Loaded history: " .. sid)
-        connection:SendRemoteEvent(EVENTS.HISTORY_DATA, true, {
-            session_id = sid,
-            messages   = cjson.encode(messages),
-        })
+
+        local resData = VariantMap()
+        resData["session_id"] = Variant(sid)
+        resData["messages"]   = Variant(cjson.encode(messages))
+        connection:SendRemoteEvent(EVENTS.HISTORY_DATA, true, resData)
     else
-        connection:SendRemoteEvent(EVENTS.CHAT_ERROR, true, {
-            error = "History not found: " .. sid,
-        })
+        local errData = VariantMap()
+        errData["error"] = Variant("History not found: " .. sid)
+        connection:SendRemoteEvent(EVENTS.CHAT_ERROR, true, errData)
     end
 end)
 
+-- 创建新对话
 SubscribeToEvent(EVENTS.HISTORY_NEW, function(eventType, eventData)
     local connection = eventData["Connection"]:GetPtr("Connection")
-    SaveHistory(connection)
+
+    -- 保存当前会话
+    SaveSessionToMemory(connection)
+
+    -- 重置
     chatHistories[connection] = {}
     sessionIds[connection] = nil
     local newSid = GetSessionId(connection)
     print("[Server] New session: " .. newSid)
 
-    connection:SendRemoteEvent(EVENTS.HISTORY_DATA, true, {
-        session_id = newSid,
-        messages   = "[]",
-    })
+    local resData = VariantMap()
+    resData["session_id"] = Variant(newSid)
+    resData["messages"]   = Variant("[]")
+    connection:SendRemoteEvent(EVENTS.HISTORY_DATA, true, resData)
 end)
 
+-- 获取历史列表
 SubscribeToEvent(EVENTS.HISTORY_LIST, function(eventType, eventData)
     local connection = eventData["Connection"]:GetPtr("Connection")
-    local list = ListHistories()
-    connection:SendRemoteEvent(EVENTS.HISTORY_LIST, true, {
-        sessions = cjson.encode(list),
-    })
+    local list = ListAllSessions()
+
+    local resData = VariantMap()
+    resData["sessions"] = Variant(cjson.encode(list))
+    connection:SendRemoteEvent(EVENTS.HISTORY_LIST, true, resData)
 end)
 
 -- ======================== 主动说话定时器（Update 事件）========================

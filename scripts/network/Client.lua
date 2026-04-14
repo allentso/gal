@@ -1,3 +1,4 @@
+---@diagnostic disable: undefined-global
 -- ============================================================================
 -- Client.lua — 客户端网络模块：聊天收发 + TTS 播放 + ASR + 打断 + 触摸 + 视觉
 -- ============================================================================
@@ -16,6 +17,12 @@ ClientNet.onHistoryData = nil   -- function(sessionId, messages) -- messages: ta
 
 local connected_ = false
 
+-- ======================== 辅助：获取服务端连接 ========================
+
+local function GetServerConn()
+    return network:GetServerConnection()
+end
+
 -- ======================== 发送：聊天消息 ========================
 
 function ClientNet.SendChat(text)
@@ -25,7 +32,12 @@ function ClientNet.SendChat(text)
         if ClientNet.onError then ClientNet.onError("未连接到服务器") end
         return
     end
-    network:SendRemoteEvent(EVENTS.CHAT_SEND, true, { text = text })
+    local serverConn = GetServerConn()
+    if not serverConn then return end
+
+    local data = VariantMap()
+    data["text"] = Variant(text)
+    serverConn:SendRemoteEvent(EVENTS.CHAT_SEND, true, data)
     print("[Client] Sent to server: " .. text)
 end
 
@@ -33,9 +45,12 @@ end
 
 function ClientNet.SendInterrupt(heardText)
     if not connected_ then return end
-    network:SendRemoteEvent(EVENTS.INTERRUPT, true, {
-        heard_text = heardText or "",
-    })
+    local serverConn = GetServerConn()
+    if not serverConn then return end
+
+    local data = VariantMap()
+    data["heard_text"] = Variant(heardText or "")
+    serverConn:SendRemoteEvent(EVENTS.INTERRUPT, true, data)
     print("[Client] Interrupt sent")
 end
 
@@ -43,7 +58,12 @@ end
 
 function ClientNet.SendTouch(area)
     if not connected_ then return end
-    network:SendRemoteEvent(EVENTS.TOUCH_EVENT, true, { area = area })
+    local serverConn = GetServerConn()
+    if not serverConn then return end
+
+    local data = VariantMap()
+    data["area"] = Variant(area)
+    serverConn:SendRemoteEvent(EVENTS.TOUCH_EVENT, true, data)
     print("[Client] Touch sent: " .. area)
 end
 
@@ -52,7 +72,12 @@ end
 function ClientNet.SendAudio(audioBase64)
     if not connected_ then return end
     if not audioBase64 or #audioBase64 == 0 then return end
-    network:SendRemoteEvent(EVENTS.AUDIO_SEND, true, { audio = audioBase64 })
+    local serverConn = GetServerConn()
+    if not serverConn then return end
+
+    local data = VariantMap()
+    data["audio"] = Variant(audioBase64)
+    serverConn:SendRemoteEvent(EVENTS.AUDIO_SEND, true, data)
     print("[Client] Audio sent for ASR")
 end
 
@@ -61,10 +86,13 @@ end
 function ClientNet.SendImage(imageBase64, text)
     if not connected_ then return end
     if not imageBase64 or #imageBase64 == 0 then return end
-    network:SendRemoteEvent(EVENTS.IMAGE_SEND, true, {
-        data = imageBase64,
-        text = text or "",
-    })
+    local serverConn = GetServerConn()
+    if not serverConn then return end
+
+    local data = VariantMap()
+    data["data"] = Variant(imageBase64)
+    data["text"] = Variant(text or "")
+    serverConn:SendRemoteEvent(EVENTS.IMAGE_SEND, true, data)
     print("[Client] Image sent for vision")
 end
 
@@ -72,17 +100,28 @@ end
 
 function ClientNet.RequestHistoryList()
     if not connected_ then return end
-    network:SendRemoteEvent(EVENTS.HISTORY_LIST, true, {})
+    local serverConn = GetServerConn()
+    if not serverConn then return end
+
+    serverConn:SendRemoteEvent(EVENTS.HISTORY_LIST, true)
 end
 
 function ClientNet.LoadHistory(sessionId)
     if not connected_ then return end
-    network:SendRemoteEvent(EVENTS.HISTORY_LOAD, true, { session_id = sessionId })
+    local serverConn = GetServerConn()
+    if not serverConn then return end
+
+    local data = VariantMap()
+    data["session_id"] = Variant(sessionId)
+    serverConn:SendRemoteEvent(EVENTS.HISTORY_LOAD, true, data)
 end
 
 function ClientNet.NewHistory()
     if not connected_ then return end
-    network:SendRemoteEvent(EVENTS.HISTORY_NEW, true, {})
+    local serverConn = GetServerConn()
+    if not serverConn then return end
+
+    serverConn:SendRemoteEvent(EVENTS.HISTORY_NEW, true)
 end
 
 -- ======================== 接收事件 ========================
@@ -138,16 +177,29 @@ end)
 -- ======================== 连接管理 ========================
 
 function ClientNet.Init()
-    if network.serverRunning then
+    -- 多人架构中，连接在 Start() 之前就已建立
+    -- 直接检查 GetServerConnection() 是否已存在
+    local serverConn = GetServerConn()
+    if serverConn then
+        connected_ = true
+        print("[Client] Already connected to server")
+        serverConn:SendRemoteEvent(EVENTS.CLIENT_READY, true)
+    elseif network.serverRunning then
+        -- 单进程调试模式
         connected_ = true
         print("[Client] Running in same process as server, connected")
-        return
+    else
+        print("[Client] No server connection yet, waiting...")
     end
 
+    -- 仍然订阅事件以处理断线重连
     SubscribeToEvent("ServerConnected", function()
         connected_ = true
         print("[Client] Connected to server")
-        network:SendRemoteEvent(EVENTS.CLIENT_READY, true, {})
+        local conn = GetServerConn()
+        if conn then
+            conn:SendRemoteEvent(EVENTS.CLIENT_READY, true)
+        end
     end)
 
     SubscribeToEvent("ServerDisconnected", function()

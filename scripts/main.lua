@@ -4,9 +4,29 @@
 --       LLM 驱动表情 · AI 主动说话 · 触摸互动 · 视觉感知（截图）
 -- ============================================================================
 
-local UI = require("urhox-libs/UI")
-
+-- 多人架构：服务端只加载 Server.lua，客户端走下面的 UI 逻辑
 require("network/Shared")
+
+if IsServerMode() then
+    require("network/Server")
+
+    function Start()
+        -- 服务端需要一个 Scene 供 connection.scene 赋值
+        scene_ = Scene()
+        scene_:CreateComponent("Octree")
+        print("[Server] AI Girlfriend server started")
+    end
+
+    function Stop()
+        print("[Server] AI Girlfriend server stopped")
+    end
+
+    return
+end
+
+local UI = require("urhox-libs/UI")
+local Base64 = require("utils/base64")
+
 local ClientNet = require("network/Client")
 local Config    = require("config")
 
@@ -359,34 +379,33 @@ local function PlayTTSAudio(audioBase64, format)
 
     SetSpeakingState(true)
 
-    -- Urho3D: decode base64 -> write temp file -> play via SoundSource
-    -- 实际实现取决于 Urhox 引擎能力；此处提供框架
-    local tempPath = "data/temp_tts." .. (format or "wav")
-    local decoded = nil
+    -- Base64 解码 → 写临时文件 → 播放
+    local tempPath = "temp_tts." .. (format or "wav")
+    local decoded = Base64.decode(audioBase64)
 
-    -- 尝试用引擎内置 base64 解码（若可用）
-    if _G.Base64Decode then
-        decoded = Base64Decode(audioBase64)
-    end
+    if decoded and #decoded > 0 then
+        -- 使用 UrhoX File 类写入（客户端模式支持文件写入）
+        local file = File(tempPath, FILE_WRITE)
+        if file:IsOpen() then
+            file:WriteString(decoded)
+            file:Close()
 
-    if decoded then
-        local f = io.open(tempPath, "wb")
-        if f then
-            f:write(decoded)
-            f:close()
-        end
-
-        -- Urho3D 播放
-        if _G.SoundSource and _G.Sound then
+            -- 播放音频
             local sound = cache:GetResource("Sound", tempPath)
             if sound then
-                local source = scene_:CreateComponent("SoundSource")
-                source:Play(sound)
-                source.autoRemoveMode = REMOVE_COMPONENT
+                ---@type Scene
+                local sc = scene_
+                if sc then
+                    local source = sc:CreateComponent("SoundSource")
+                    source:Play(sound)
+                    source.autoRemoveMode = REMOVE_COMPONENT
+                end
             end
+        else
+            print("[Client] Failed to write TTS temp file")
         end
     else
-        print("[Client] Base64 decode not available, TTS audio skipped")
+        print("[Client] Base64 decode failed or empty audio")
     end
 
     -- 模拟播放时长后恢复（粗略估算：每字 0.3 秒）
@@ -405,38 +424,53 @@ end
 -- 11. 聊天系统
 -- ============================================================================
 
+-- 缓存屏幕逻辑宽度（避免每次创建气泡都计算）
+local cachedScreenW_ = nil
+local function GetScreenW()
+    if not cachedScreenW_ then
+        cachedScreenW_ = math.floor(graphics:GetWidth() / graphics:GetDPR())
+    end
+    return cachedScreenW_
+end
+
 local function CreateBubble(msg)
     local isSelf = msg.isSelf
+    local sw = GetScreenW()
+    local bubbleW = math.floor(sw * 0.6)    -- 气泡宽 = 屏幕 3/5
+    local textW = bubbleW - 24              -- 减去左右 padding 12*2
+
     return UI.Panel {
-        width = "100%",
+        width = sw,
         flexDirection = "row",
         justifyContent = isSelf and "flex-end" or "flex-start",
-        paddingHorizontal = 14,
+        paddingHorizontal = 10,
         marginBottom = 3,
         children = {
             UI.Panel {
-                maxWidth = "72%",
-                paddingHorizontal = 14,
-                paddingVertical = 9,
+                width = bubbleW,
+                flexShrink = 0,
+                paddingHorizontal = 12,
+                paddingVertical = 8,
                 backgroundColor = isSelf and C.bubbleSelf or C.bubbleOther,
-                borderRadius = isSelf and { 16, 16, 4, 16 } or { 16, 16, 16, 4 },
+                borderRadius = isSelf and { 14, 14, 4, 14 } or { 14, 14, 14, 4 },
                 boxShadow = {
                     { x = 0, y = 2, blur = 8, spread = 0, color = { 0, 0, 0, 30 } },
                 },
                 children = {
                     UI.Label {
                         text = msg.text,
+                        width = textW,
                         fontSize = 13,
                         fontColor = isSelf and { 255, 255, 255, 255 } or C.text,
                         whiteSpace = "normal",
-                        lineHeight = 1.5,
+                        lineHeight = 1.4,
                     },
                     UI.Label {
                         text = msg.time,
                         fontSize = 9,
                         fontColor = isSelf and { 255, 255, 255, 130 } or C.textMuted,
                         textAlign = "right",
-                        marginTop = 3,
+                        marginTop = 2,
                     },
                 },
             },
@@ -691,25 +725,28 @@ local function BuildTopBar()
                 hoverBackgroundColor = { 255, 120, 160, 80 },
                 onClick = function(self)
                     print("[Client] Screenshot requested")
-                    local tempScreenshot = "data/screenshot_temp.png"
-                    -- Urho3D 截图
-                    if graphics and graphics.TakeScreenShot then
-                        local image = Image()
-                        graphics:TakeScreenShot(image)
-                        image:SavePNG(tempScreenshot)
+                    local tempScreenshot = "screenshot_temp.png"
+                    -- UrhoX 截图
+                    local image = Image()
+                    graphics:TakeScreenShot(image)
+                    image:SavePNG(tempScreenshot)
 
-                        local f = io.open(tempScreenshot, "rb")
-                        if f then
-                            local raw = f:read("*a")
-                            f:close()
-                            if _G.Base64Encode then
-                                local b64 = Base64Encode(raw)
+                    -- 用 File 类读取截图文件
+                    if fileSystem:FileExists(tempScreenshot) then
+                        local file = File(tempScreenshot, FILE_READ)
+                        if file:IsOpen() then
+                            local raw = file:ReadString()
+                            file:Close()
+                            if raw and #raw > 0 then
+                                local b64 = Base64.encode(raw)
                                 ClientNet.SendImage(b64, "看看我的屏幕~")
                                 AddMessage("[发送了截图]", true)
                                 ShowTyping(true)
                             else
-                                AddMessage("(截图功能暂不可用)", false)
+                                AddMessage("(截图读取失败)", false)
                             end
+                        else
+                            AddMessage("(截图文件打开失败)", false)
                         end
                     else
                         AddMessage("(截图功能暂不可用)", false)
@@ -761,7 +798,7 @@ local function BuildChatPanel()
 
     chatContainer_ = UI.Panel {
         id = "msgs",
-        width = "100%",
+        width = GetScreenW(),
         paddingTop = 8,
         paddingBottom = 4,
         gap = 2,
@@ -863,29 +900,34 @@ local function BuildChatPanel()
                 self:SetStyle({ backgroundColor = { 45, 48, 65, 220 } })
                 print("[Client] Recording stopped")
 
-                -- 读取录音文件并发送
-                local tempAudio = "data/temp_recording.wav"
-                local f = io.open(tempAudio, "rb")
-                if f then
-                    local raw = f:read("*a")
-                    f:close()
-                    if _G.Base64Encode then
-                        local b64 = Base64Encode(raw)
-                        ClientNet.SendAudio(b64)
-                        ShowTyping(true)
-                        AddMessage("[语音消息]", true)
+                -- 读取录音文件并发送（使用 UrhoX File 类）
+                local tempAudio = "temp_recording.wav"
+                if fileSystem:FileExists(tempAudio) then
+                    local file = File(tempAudio, FILE_READ)
+                    if file:IsOpen() then
+                        local raw = file:ReadString()
+                        file:Close()
+                        if raw and #raw > 0 then
+                            local b64 = Base64.encode(raw)
+                            ClientNet.SendAudio(b64)
+                            ShowTyping(true)
+                            AddMessage("[语音消息]", true)
+                        else
+                            AddMessage("(录音文件为空)", false)
+                        end
+                    else
+                        AddMessage("(录音文件打开失败)", false)
                     end
                 else
-                    AddMessage("(录音失败)", false)
+                    AddMessage("(录音文件不存在)", false)
                 end
             else
                 -- 开始录音
                 isRecording_ = true
                 self:SetStyle({ backgroundColor = C.danger })
                 print("[Client] Recording started")
-                -- 实际录音实现依赖引擎/OS能力
-                -- 若引擎不支持原生录音，可使用 os.execute 调 ffmpeg
-                -- os.execute('start /b ffmpeg -f dshow -i audio="Microphone" -t 10 data/temp_recording.wav -y')
+                -- 注意：录音功能依赖平台原生能力，目前为占位实现
+                -- WASM 平台暂不支持麦克风录音
             end
         end,
     }
