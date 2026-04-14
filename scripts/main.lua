@@ -1,25 +1,23 @@
 -- ============================================================================
 -- AI 女友 — 视觉小说风格 · 仿 Live2D 角色动画
--- 布局: 角色立绘占满大半屏幕 + 底部半透明聊天面板
--- 动画: 呼吸起伏 · 身体轻摇 · 表情淡入淡出 · 互动弹跳 · 飘浮粒子
+-- 功能: LLM 对话 · TTS 语音 · ASR 语音输入 · 对话记忆 · 打断机制
+--       LLM 驱动表情 · AI 主动说话 · 触摸互动 · 视觉感知（截图）
 -- ============================================================================
 
 local UI = require("urhox-libs/UI")
+
+require("network/Shared")
+local ClientNet = require("network/Client")
+local Config    = require("config")
+
+local AI_ENABLED = true
 
 -- ============================================================================
 -- 1. 角色与表情配置
 -- ============================================================================
 
-local GF = {
-    name     = "小雪",
-    age      = "20",
-    sign     = "天秤座",
-    hobby    = "画画、听音乐、看日落",
-    bio      = "喜欢安静的午后，和你在一起的每一刻都是最好的时光。",
-    avatar   = "image/girlfriend_avatar_20260413152437.png",
-}
+local GF = Config.CHARACTER
 
--- 表情立绘路径（每张透明底全身立绘）
 local EXPR_IMAGES = {
     normal    = "image/gf_normal_20260413153652.png",
     happy     = "image/gf_happy_20260413153548.png",
@@ -30,7 +28,6 @@ local EXPR_IMAGES = {
 
 local BG_IMAGE = "image/scene_bg_20260413153659.png"
 
--- 表情 → 粒子映射
 local EXPR_PARTICLES = {
     happy     = { emoji = "✨", count = 5 },
     shy       = { emoji = "❤️", count = 4 },
@@ -40,7 +37,7 @@ local EXPR_PARTICLES = {
 }
 
 -- ============================================================================
--- 2. 回复系统
+-- 2. 本地回复系统（离线 fallback）
 -- ============================================================================
 
 local REPLY_POOL = {
@@ -115,7 +112,6 @@ local REPLY_POOL = {
     },
 }
 
---- 关键词匹配
 local function MatchCategory(text)
     local t = string.lower(text)
     if string.find(t, "你好") or string.find(t, "嗨") or string.find(t, "hi")
@@ -142,8 +138,7 @@ local function MatchCategory(text)
     return "default"
 end
 
---- 生成回复
-local function GenerateReply(userText)
+local function GenerateLocalReply(userText)
     local cat = MatchCategory(userText)
     local pool = REPLY_POOL[cat]
     local text = pool.replies[math.random(1, #pool.replies)]
@@ -169,25 +164,39 @@ local C = {
     online       = { 80, 220, 120, 255 },
     divider      = { 60, 65, 90, 80 },
     topBarBg     = { 10, 10, 25, 200 },
+    danger       = { 255, 80, 80, 255 },
 }
 
 -- ============================================================================
 -- 4. 全局状态
 -- ============================================================================
 
-local uiRoot_         = nil
-local exprPanels_     = {}    -- { normal = Panel, happy = Panel, ... }
-local currentExpr_    = "normal"
-local characterSway_  = nil
-local characterBreath_= nil
-local particleLayer_  = nil
-local chatContainer_  = nil
-local chatScroll_     = nil
-local inputField_     = nil
-local typingLabel_    = nil
-local affection_      = 72
-local messages_       = {}
-local replyTimer_     = nil   -- { elapsed, delay, text, expr, cat }
+local uiRoot_          = nil
+local exprPanels_      = {}
+local currentExpr_     = "normal"
+local characterSway_   = nil
+local characterBreath_ = nil
+local particleLayer_   = nil
+local chatContainer_   = nil
+local chatScroll_      = nil
+local inputField_      = nil
+local typingLabel_     = nil
+local affection_       = 72
+local messages_        = {}
+local replyTimer_      = nil   -- { elapsed, delay, text, expr, cat }
+
+-- 表情回归计时器
+local exprRevertTimer_ = nil   -- { elapsed, delay }
+
+-- TTS / 打断
+local aiSpeaking_      = false
+local currentReplyText_= ""
+local interruptBtn_    = nil
+local sendBtn_         = nil
+
+-- ASR
+local isRecording_     = false
+local voiceBtn_        = nil
 
 -- ============================================================================
 -- 5. 时间工具
@@ -199,20 +208,27 @@ local function TimeStr()
 end
 
 -- ============================================================================
--- 6. 表情切换系统
+-- 6. 表情切换系统（带回归计时器）
 -- ============================================================================
 
 local function SwitchExpression(newExpr)
     if newExpr == currentExpr_ then return end
-    -- 淡出当前
     if exprPanels_[currentExpr_] then
         exprPanels_[currentExpr_]:SetStyle({ opacity = 0 })
     end
-    -- 淡入新表情
     if exprPanels_[newExpr] then
         exprPanels_[newExpr]:SetStyle({ opacity = 1 })
     end
     currentExpr_ = newExpr
+
+    if newExpr ~= "normal" then
+        exprRevertTimer_ = {
+            elapsed = 0,
+            delay   = Config.AI.EXPR_REVERT_DELAY,
+        }
+    else
+        exprRevertTimer_ = nil
+    end
 end
 
 -- ============================================================================
@@ -231,13 +247,13 @@ local function SpawnParticle(parent, emoji, offsetX, startY)
     local endY = startY - math.random(80, 180)
     p:Animate({
         keyframes = {
-            [0]   = { opacity = 0, translateX = offsetX, translateY = startY, scale = 0.3 },
+            [0]    = { opacity = 0, translateX = offsetX, translateY = startY, scale = 0.3 },
             [0.15] = { opacity = 1, translateX = offsetX + math.random(-10, 10),
                        translateY = startY - 30, scale = 1.1 },
-            [0.7] = { opacity = 0.7, translateX = offsetX + math.random(-20, 20),
-                      translateY = endY + 30, scale = 0.9 },
-            [1]   = { opacity = 0, translateX = offsetX + math.random(-15, 15),
-                      translateY = endY, scale = 0.5 },
+            [0.7]  = { opacity = 0.7, translateX = offsetX + math.random(-20, 20),
+                       translateY = endY + 30, scale = 0.9 },
+            [1]    = { opacity = 0, translateX = offsetX + math.random(-15, 15),
+                       translateY = endY, scale = 0.5 },
         },
         duration = 1.8 + math.random() * 0.8,
         easing = "easeOut",
@@ -255,7 +271,6 @@ local function SpawnParticlesForExpr(exprOrCat)
     for i = 1, info.count do
         local ox = math.random(-90, 90)
         local sy = math.random(-20, 60)
-        -- 稍微错开每个粒子的生成时间感觉
         SpawnParticle(particleLayer_, info.emoji, ox, sy)
     end
 end
@@ -266,7 +281,6 @@ end
 
 local function BounceCharacter()
     if not characterBreath_ then return end
-    -- 先停止呼吸动画，播放弹跳，再恢复
     characterBreath_:StopAnimation()
     characterBreath_:Animate({
         keyframes = {
@@ -319,7 +333,76 @@ local function StartSwayAnimation()
 end
 
 -- ============================================================================
--- 10. 聊天系统
+-- 10. TTS 音频播放 + 打断
+-- ============================================================================
+
+local function SetSpeakingState(speaking)
+    aiSpeaking_ = speaking
+    if interruptBtn_ then
+        interruptBtn_:SetVisible(speaking)
+    end
+    if sendBtn_ then
+        sendBtn_:SetVisible(not speaking)
+    end
+end
+
+local function StopSpeaking()
+    if not aiSpeaking_ then return end
+    SetSpeakingState(false)
+    -- 通知服务端打断
+    ClientNet.SendInterrupt(currentReplyText_)
+    currentReplyText_ = ""
+end
+
+local function PlayTTSAudio(audioBase64, format)
+    if not audioBase64 or #audioBase64 == 0 then return end
+
+    SetSpeakingState(true)
+
+    -- Urho3D: decode base64 -> write temp file -> play via SoundSource
+    -- 实际实现取决于 Urhox 引擎能力；此处提供框架
+    local tempPath = "data/temp_tts." .. (format or "wav")
+    local decoded = nil
+
+    -- 尝试用引擎内置 base64 解码（若可用）
+    if _G.Base64Decode then
+        decoded = Base64Decode(audioBase64)
+    end
+
+    if decoded then
+        local f = io.open(tempPath, "wb")
+        if f then
+            f:write(decoded)
+            f:close()
+        end
+
+        -- Urho3D 播放
+        if _G.SoundSource and _G.Sound then
+            local sound = cache:GetResource("Sound", tempPath)
+            if sound then
+                local source = scene_:CreateComponent("SoundSource")
+                source:Play(sound)
+                source.autoRemoveMode = REMOVE_COMPONENT
+            end
+        end
+    else
+        print("[Client] Base64 decode not available, TTS audio skipped")
+    end
+
+    -- 模拟播放时长后恢复（粗略估算：每字 0.3 秒）
+    local estimatedDuration = math.max(2.0, #currentReplyText_ * 0.3)
+    replyTimer_ = {
+        elapsed = 0,
+        delay   = estimatedDuration,
+        text    = nil,
+        expr    = "normal",
+        cat     = "default",
+        isTTSDone = true,
+    }
+end
+
+-- ============================================================================
+-- 11. 聊天系统
 -- ============================================================================
 
 local function CreateBubble(msg)
@@ -378,33 +461,46 @@ local function ShowTyping(show)
     end
 end
 
+local function ReceiveAIReply(replyText, expr)
+    ShowTyping(false)
+    SwitchExpression(expr)
+    AddMessage(replyText, false)
+    BounceCharacter()
+    SpawnParticlesForExpr(expr)
+    currentReplyText_ = replyText
+end
+
 local function SendMessage(text)
     if not text or #text == 0 then return end
-    AddMessage(text, true)
 
-    -- 增加好感
+    if aiSpeaking_ then
+        StopSpeaking()
+    end
+
+    AddMessage(text, true)
     affection_ = math.min(100, affection_ + 1)
 
-    -- 准备回复
-    local replyText, expr, cat = GenerateReply(text)
-    local delay = 0.8 + math.random() * 1.0
-
-    ShowTyping(true)
-
-    replyTimer_ = {
-        elapsed = 0,
-        delay   = delay,
-        text    = replyText,
-        expr    = expr,
-        cat     = cat,
-    }
+    if AI_ENABLED and ClientNet.IsConnected() then
+        ShowTyping(true)
+        ClientNet.SendChat(text)
+    else
+        local replyText, expr, cat = GenerateLocalReply(text)
+        local delay = 0.8 + math.random() * 1.0
+        ShowTyping(true)
+        replyTimer_ = {
+            elapsed = 0,
+            delay   = delay,
+            text    = replyText,
+            expr    = expr,
+            cat     = cat,
+        }
+    end
 end
 
 -- ============================================================================
--- 11. UI 构建
+-- 12. UI 构建
 -- ============================================================================
 
---- 全屏背景
 local function BuildBackground()
     return UI.Panel {
         id = "bg",
@@ -413,7 +509,6 @@ local function BuildBackground()
         backgroundImage = BG_IMAGE,
         backgroundFit = "cover",
         pointerEvents = "none",
-        -- 底部渐变遮罩用 backgroundGradient 叠加
         children = {
             UI.Panel {
                 position = "absolute",
@@ -430,9 +525,8 @@ local function BuildBackground()
     }
 end
 
---- 角色层（仿 Live2D：轻摇 → 呼吸 → 表情叠层）
+--- 角色层：支持触摸热区（头部 / 脸颊 / 身体）
 local function BuildCharacter()
-    -- 构建表情面板
     local exprChildren = {}
     local order = { "normal", "happy", "shy", "sad", "surprised" }
     for _, id in ipairs(order) do
@@ -451,7 +545,6 @@ local function BuildCharacter()
         table.insert(exprChildren, panel)
     end
 
-    -- 呼吸层
     characterBreath_ = UI.Panel {
         id = "breath",
         width = "100%",
@@ -460,7 +553,6 @@ local function BuildCharacter()
         children = exprChildren,
     }
 
-    -- 轻摇层
     characterSway_ = UI.Panel {
         id = "sway",
         width = "100%",
@@ -469,7 +561,6 @@ local function BuildCharacter()
         children = { characterBreath_ },
     }
 
-    -- 粒子层
     particleLayer_ = UI.Panel {
         id = "particles",
         position = "absolute",
@@ -481,7 +572,28 @@ local function BuildCharacter()
         pointerEvents = "none",
     }
 
-    -- 角色整体容器：点击弹跳
+    local function MakeTouchZone(id, area, top, height)
+        return UI.Panel {
+            id = id,
+            position = "absolute",
+            top = top,
+            left = 0, right = 0,
+            height = height,
+            pointerEvents = "auto",
+            onClick = function(self)
+                BounceCharacter()
+                local reactions = { "happy", "shy", "surprised" }
+                local r = reactions[math.random(1, #reactions)]
+                SwitchExpression(r)
+                SpawnParticlesForExpr(r)
+
+                if Config.TOUCH.ENABLED and AI_ENABLED and ClientNet.IsConnected() then
+                    ClientNet.SendTouch(area)
+                end
+            end,
+        }
+    end
+
     return UI.Panel {
         id = "characterArea",
         position = "absolute",
@@ -491,31 +603,18 @@ local function BuildCharacter()
         justifyContent = "flex-end",
         pointerEvents = "box-none",
         children = {
-            -- 角色本体
             UI.Panel {
                 width = "75%",
                 maxWidth = 420,
                 height = "95%",
                 pointerEvents = "auto",
-                onClick = function(self)
-                    BounceCharacter()
-                    -- 点击时随机小互动
-                    local reactions = { "happy", "shy", "surprised" }
-                    local r = reactions[math.random(1, #reactions)]
-                    SwitchExpression(r)
-                    SpawnParticlesForExpr(r)
-                    -- 2秒后恢复
-                    replyTimer_ = {
-                        elapsed = 0,
-                        delay = 2.0,
-                        text = nil, -- 不发消息，只恢复表情
-                        expr = "normal",
-                        cat = "default",
-                    }
-                end,
-                children = { characterSway_ },
+                children = {
+                    characterSway_,
+                    MakeTouchZone("touchHead", "head", 0, "25%"),
+                    MakeTouchZone("touchFace", "face", "25%", "20%"),
+                    MakeTouchZone("touchBody", "body", "45%", "55%"),
+                },
             },
-            -- 角色脚下阴影
             UI.Panel {
                 width = 160,
                 height = 12,
@@ -524,13 +623,11 @@ local function BuildCharacter()
                 marginBottom = 4,
                 pointerEvents = "none",
             },
-            -- 粒子覆盖层
             particleLayer_,
         },
     }
 end
 
---- 顶部信息栏（半透明悬浮）
 local function BuildTopBar()
     return UI.Panel {
         id = "topBar",
@@ -544,7 +641,6 @@ local function BuildTopBar()
         backgroundColor = C.topBarBg,
         pointerEvents = "auto",
         children = {
-            -- 头像
             UI.Panel {
                 width = 38, height = 38,
                 borderRadius = 19,
@@ -554,12 +650,11 @@ local function BuildTopBar()
                 children = {
                     UI.Panel {
                         width = "100%", height = "100%",
-                        backgroundImage = GF.avatar,
+                        backgroundImage = GF.AVATAR,
                         backgroundFit = "cover",
                     },
                 },
             },
-            -- 名称 + 状态
             UI.Panel {
                 flexGrow = 1, gap = 2,
                 children = {
@@ -567,7 +662,7 @@ local function BuildTopBar()
                         flexDirection = "row", alignItems = "center", gap = 6,
                         children = {
                             UI.Label {
-                                text = GF.name,
+                                text = GF.NAME,
                                 fontSize = 15,
                                 fontColor = C.text,
                                 fontWeight = "bold",
@@ -585,6 +680,41 @@ local function BuildTopBar()
                         fontColor = C.textSec,
                     },
                 },
+            },
+            -- 截图按钮（视觉感知）
+            UI.Button {
+                text = "📷",
+                width = 34, height = 34,
+                borderRadius = 17,
+                fontSize = 15,
+                backgroundColor = { 45, 48, 65, 200 },
+                hoverBackgroundColor = { 255, 120, 160, 80 },
+                onClick = function(self)
+                    print("[Client] Screenshot requested")
+                    local tempScreenshot = "data/screenshot_temp.png"
+                    -- Urho3D 截图
+                    if graphics and graphics.TakeScreenShot then
+                        local image = Image()
+                        graphics:TakeScreenShot(image)
+                        image:SavePNG(tempScreenshot)
+
+                        local f = io.open(tempScreenshot, "rb")
+                        if f then
+                            local raw = f:read("*a")
+                            f:close()
+                            if _G.Base64Encode then
+                                local b64 = Base64Encode(raw)
+                                ClientNet.SendImage(b64, "看看我的屏幕~")
+                                AddMessage("[发送了截图]", true)
+                                ShowTyping(true)
+                            else
+                                AddMessage("(截图功能暂不可用)", false)
+                            end
+                        end
+                    else
+                        AddMessage("(截图功能暂不可用)", false)
+                    end
+                end,
             },
             -- 好感度
             UI.Panel {
@@ -614,9 +744,7 @@ local function BuildTopBar()
     }
 end
 
---- 底部聊天面板
 local function BuildChatPanel()
-    -- 打字指示
     typingLabel_ = UI.Panel {
         id = "typing",
         visible = false,
@@ -626,12 +754,11 @@ local function BuildChatPanel()
         paddingVertical = 4,
         gap = 3,
         children = {
-            UI.Label { text = GF.name .. " 正在输入", fontSize = 11, fontColor = C.textMuted },
+            UI.Label { text = GF.NAME .. " 正在思考", fontSize = 11, fontColor = C.textMuted },
             UI.Label { text = "···", fontSize = 11, fontColor = C.accent },
         },
     }
 
-    -- 消息容器
     chatContainer_ = UI.Panel {
         id = "msgs",
         width = "100%",
@@ -640,7 +767,6 @@ local function BuildChatPanel()
         gap = 2,
     }
 
-    -- 初始消息
     local welcome = {
         { text = "你终于来啦！我等你好久了~ 😊", isSelf = false, time = "09:00" },
         { text = "今天天气好好，想和你一起出去走走~", isSelf = false, time = "09:01" },
@@ -681,7 +807,6 @@ local function BuildChatPanel()
             textColor = C.textSec,
             transition = "backgroundColor 0.2s easeOut",
             onClick = function(self)
-                -- 提取纯文字（去掉 emoji 前缀）
                 local pure = string.sub(qr.t, string.find(qr.t, " ") + 1)
                 SendMessage(pure)
             end,
@@ -719,6 +844,82 @@ local function BuildChatPanel()
         end,
     }
 
+    -- 语音按钮（ASR）
+    voiceBtn_ = UI.Button {
+        text = "🎤",
+        width = 40, height = 40,
+        borderRadius = 20, fontSize = 17,
+        backgroundColor = { 45, 48, 65, 220 },
+        hoverBackgroundColor = { 255, 120, 160, 80 },
+        transition = "backgroundColor 0.15s easeOut",
+        onClick = function(self)
+            if not Config.ASR.ENABLED then
+                AddMessage("(语音识别未启用)", false)
+                return
+            end
+            if isRecording_ then
+                -- 结束录音
+                isRecording_ = false
+                self:SetStyle({ backgroundColor = { 45, 48, 65, 220 } })
+                print("[Client] Recording stopped")
+
+                -- 读取录音文件并发送
+                local tempAudio = "data/temp_recording.wav"
+                local f = io.open(tempAudio, "rb")
+                if f then
+                    local raw = f:read("*a")
+                    f:close()
+                    if _G.Base64Encode then
+                        local b64 = Base64Encode(raw)
+                        ClientNet.SendAudio(b64)
+                        ShowTyping(true)
+                        AddMessage("[语音消息]", true)
+                    end
+                else
+                    AddMessage("(录音失败)", false)
+                end
+            else
+                -- 开始录音
+                isRecording_ = true
+                self:SetStyle({ backgroundColor = C.danger })
+                print("[Client] Recording started")
+                -- 实际录音实现依赖引擎/OS能力
+                -- 若引擎不支持原生录音，可使用 os.execute 调 ffmpeg
+                -- os.execute('start /b ffmpeg -f dshow -i audio="Microphone" -t 10 data/temp_recording.wav -y')
+            end
+        end,
+    }
+
+    -- 发送按钮
+    sendBtn_ = UI.Button {
+        text = "💌",
+        width = 40, height = 40,
+        borderRadius = 20, fontSize = 17,
+        backgroundGradient = {
+            type = "linear", direction = "to-right",
+            from = C.accentFrom, to = C.accentTo,
+        },
+        transition = "scale 0.12s easeOut",
+        onClick = function(self)
+            local text = inputField_:GetValue()
+            SendMessage(text)
+            inputField_:Clear()
+        end,
+    }
+
+    -- 打断按钮（AI 说话时替换发送按钮）
+    interruptBtn_ = UI.Button {
+        text = "⏹",
+        width = 40, height = 40,
+        borderRadius = 20, fontSize = 17,
+        visible = false,
+        backgroundColor = C.danger,
+        transition = "scale 0.12s easeOut",
+        onClick = function(self)
+            StopSpeaking()
+        end,
+    }
+
     local inputBar = UI.Panel {
         width = "100%",
         flexDirection = "row",
@@ -728,26 +929,13 @@ local function BuildChatPanel()
         paddingBottom = 10,
         gap = 8,
         children = {
+            voiceBtn_,
             inputField_,
-            UI.Button {
-                text = "💌",
-                width = 40, height = 40,
-                borderRadius = 20, fontSize = 17,
-                backgroundGradient = {
-                    type = "linear", direction = "to-right",
-                    from = C.accentFrom, to = C.accentTo,
-                },
-                transition = "scale 0.12s easeOut",
-                onClick = function(self)
-                    local text = inputField_:GetValue()
-                    SendMessage(text)
-                    inputField_:Clear()
-                end,
-            },
+            sendBtn_,
+            interruptBtn_,
         },
     }
 
-    -- 整个聊天面板
     return UI.Panel {
         id = "chatPanel",
         position = "absolute",
@@ -762,7 +950,6 @@ local function BuildChatPanel()
         borderColor = { 255, 255, 255, 15 },
         backdropBlur = 10,
         children = {
-            -- 把手
             UI.Panel {
                 width = "100%", alignItems = "center",
                 paddingVertical = 8, pointerEvents = "none",
@@ -783,11 +970,11 @@ local function BuildChatPanel()
 end
 
 -- ============================================================================
--- 12. 生命周期
+-- 13. 生命周期
 -- ============================================================================
 
 function Start()
-    graphics.windowTitle = "AI女友 - " .. GF.name
+    graphics.windowTitle = "AI女友 - " .. GF.NAME
 
     UI.Init({
         fonts = {
@@ -812,14 +999,64 @@ function Start()
 
     UI.SetRoot(uiRoot_)
 
-    -- 启动 Live2D 动画
     StartBreathingAnimation()
     StartSwayAnimation()
+
+    -- 网络回调
+    ClientNet.Init()
+
+    ClientNet.onReply = function(text, expression)
+        ReceiveAIReply(text, expression)
+    end
+
+    ClientNet.onTyping = function()
+        ShowTyping(true)
+    end
+
+    ClientNet.onError = function(errorMsg)
+        ShowTyping(false)
+        AddMessage("(连接异常: " .. errorMsg .. ")", false)
+    end
+
+    ClientNet.onAudioPlay = function(audioBase64, format)
+        PlayTTSAudio(audioBase64, format)
+    end
+
+    ClientNet.onASRResult = function(text)
+        if text and #text > 0 then
+            if inputField_ then
+                inputField_:SetValue(text)
+            end
+        end
+    end
+
+    ClientNet.onHistoryData = function(sessionId, messages)
+        if chatContainer_ then
+            chatContainer_:RemoveAllChildren()
+        end
+        messages_ = {}
+        if messages then
+            for _, msg in ipairs(messages) do
+                local isSelf = (msg.role == "user")
+                AddMessage(msg.content, isSelf)
+            end
+        end
+        print("[Client] History loaded: " .. sessionId)
+    end
 
     SubscribeToEvent("Update", "HandleUpdate")
     SubscribeToEvent("KeyDown", "HandleKeyDown")
 
-    print("=== AI女友 · " .. GF.name .. " 已上线 ===")
+    print("=== AI女友 · " .. GF.NAME .. " 已上线 ===")
+    if AI_ENABLED then
+        print("AI 模式: 已启用（服务端 → LLM API）")
+        print("TTS:  " .. (Config.TTS.ENABLED and "已启用" or "已禁用"))
+        print("ASR:  " .. (Config.ASR.ENABLED and "已启用" or "已禁用"))
+        print("触摸: " .. (Config.TOUCH.ENABLED and "已启用" or "已禁用"))
+        print("视觉: " .. (Config.VISION.ENABLED and "已启用" or "已禁用"))
+    else
+        print("AI 模式: 离线（本地回复池）")
+    end
     print("点击角色可以互动，输入文字或使用快捷回复聊天~")
 end
 
@@ -832,24 +1069,35 @@ end
 function HandleUpdate(eventType, eventData)
     local dt = eventData["TimeStep"]:GetFloat()
 
-    -- 回复计时器
+    -- 回复计时器（本地回复 / TTS 播放完毕恢复）
     if replyTimer_ then
         replyTimer_.elapsed = replyTimer_.elapsed + dt
         if replyTimer_.elapsed >= replyTimer_.delay then
             local r = replyTimer_
             replyTimer_ = nil
-            ShowTyping(false)
-            SwitchExpression(r.expr)
 
-            if r.text then
-                -- 正式回复消息
-                AddMessage(r.text, false)
-                BounceCharacter()
-                -- 粒子效果
-                local particleCat = r.cat
-                if r.cat == "love" then particleCat = "shy" end
-                SpawnParticlesForExpr(particleCat)
+            if r.isTTSDone then
+                SetSpeakingState(false)
+            else
+                ShowTyping(false)
+                SwitchExpression(r.expr)
+                if r.text then
+                    AddMessage(r.text, false)
+                    BounceCharacter()
+                    local particleCat = r.cat
+                    if r.cat == "love" then particleCat = "shy" end
+                    SpawnParticlesForExpr(particleCat)
+                end
             end
+        end
+    end
+
+    -- 表情回归计时器
+    if exprRevertTimer_ then
+        exprRevertTimer_.elapsed = exprRevertTimer_.elapsed + dt
+        if exprRevertTimer_.elapsed >= exprRevertTimer_.delay then
+            exprRevertTimer_ = nil
+            SwitchExpression("normal")
         end
     end
 end
