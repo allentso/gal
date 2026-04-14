@@ -435,19 +435,21 @@ end
 
 local function CreateBubble(msg)
     local isSelf = msg.isSelf
-    local sw = GetScreenW()
-    local bubbleW = math.floor(sw * 0.6)    -- 气泡宽 = 屏幕 3/5
-    local textW = bubbleW - 24              -- 减去左右 padding 12*2
+    -- Label 需要显式宽度才能正确换行，取屏幕宽 70% 作为文字最大换行宽度
+    local labelW = math.floor(GetScreenW() * 0.7)
+
+    -- 气泡内文本的最大宽度（像素），需要减去 bubble 左右 padding
+    local bubblePadH = 12 * 2
+    local textMaxW = labelW - bubblePadH
 
     return UI.Panel {
-        width = sw,
+        width = "100%",
         flexDirection = "row",
         justifyContent = isSelf and "flex-end" or "flex-start",
         paddingHorizontal = 10,
         marginBottom = 3,
         children = {
             UI.Panel {
-                width = bubbleW,
                 flexShrink = 0,
                 paddingHorizontal = 12,
                 paddingVertical = 8,
@@ -459,7 +461,7 @@ local function CreateBubble(msg)
                 children = {
                     UI.Label {
                         text = msg.text,
-                        width = textW,
+                        width = textMaxW,
                         fontSize = 13,
                         fontColor = isSelf and { 255, 255, 255, 255 } or C.text,
                         whiteSpace = "normal",
@@ -798,7 +800,7 @@ local function BuildChatPanel()
 
     chatContainer_ = UI.Panel {
         id = "msgs",
-        width = GetScreenW(),
+        width = "100%",
         paddingTop = 8,
         paddingBottom = 4,
         gap = 2,
