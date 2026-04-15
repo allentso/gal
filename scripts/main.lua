@@ -384,10 +384,12 @@ local function PlayTTSAudio(audioBase64, format)
     local decoded = Base64.decode(audioBase64)
 
     if decoded and #decoded > 0 then
-        -- 使用 UrhoX File 类写入（客户端模式支持文件写入）
+        -- 使用 UrhoX File 类写入（逐字节写入避免 null 字节截断）
         local file = File(tempPath, FILE_WRITE)
         if file:IsOpen() then
-            file:WriteString(decoded)
+            for i = 1, #decoded do
+                file:WriteUByte(string.byte(decoded, i))
+            end
             file:Close()
 
             -- 播放音频
@@ -726,33 +728,13 @@ local function BuildTopBar()
                 backgroundColor = { 45, 48, 65, 200 },
                 hoverBackgroundColor = { 255, 120, 160, 80 },
                 onClick = function(self)
-                    print("[Client] Screenshot requested")
-                    local tempScreenshot = "screenshot_temp.png"
-                    -- UrhoX 截图
-                    local image = Image()
-                    graphics:TakeScreenShot(image)
-                    image:SavePNG(tempScreenshot)
-
-                    -- 用 File 类读取截图文件
-                    if fileSystem:FileExists(tempScreenshot) then
-                        local file = File(tempScreenshot, FILE_READ)
-                        if file:IsOpen() then
-                            local raw = file:ReadString()
-                            file:Close()
-                            if raw and #raw > 0 then
-                                local b64 = Base64.encode(raw)
-                                ClientNet.SendImage(b64, "看看我的屏幕~")
-                                AddMessage("[发送了截图]", true)
-                                ShowTyping(true)
-                            else
-                                AddMessage("(截图读取失败)", false)
-                            end
-                        else
-                            AddMessage("(截图文件打开失败)", false)
-                        end
-                    else
-                        AddMessage("(截图功能暂不可用)", false)
+                    if not Config.VISION.ENABLED then
+                        AddMessage("(视觉感知未启用)", false)
+                        return
                     end
+                    -- 标记下一帧截图（确保当前帧已渲染完毕）
+                    pendingScreenshot_ = true
+                    AddMessage("[正在截图...]", true)
                 end,
             },
             -- 好感度
@@ -1020,6 +1002,28 @@ end
 function Start()
     graphics.windowTitle = "AI女友 - " .. GF.NAME
 
+    -- 创建 Scene + Viewport，并通过 RenderSurface 实现截图（TakeScreenShot 在 WASM 不可用）
+    local scene = Scene()
+    scene:CreateComponent("Octree")
+    local camNode = scene:CreateChild("Camera")
+    local camera = camNode:CreateComponent("Camera")
+    local vp = Viewport:new(scene, camera)
+    renderer:SetViewport(0, vp)
+
+    -- 创建 render target 纹理用于截图
+    local w = graphics:GetWidth()
+    local h = graphics:GetHeight()
+    screenshotRT_ = Texture2D:new()
+    screenshotRT_:SetNumLevels(1)
+    screenshotRT_:SetSize(w, h, Graphics:GetRGBAFormat(), TEXTURE_RENDERTARGET)
+    screenshotRT_:SetFilterMode(FILTER_BILINEAR)
+    -- 将同一个 viewport 场景渲染到 render target
+    local surface = screenshotRT_:GetRenderSurface()
+    surface:SetNumViewports(1)
+    surface:SetViewport(0, vp)
+    surface:SetUpdateMode(SURFACE_MANUALUPDATE)  -- 手动控制何时渲染
+    print("[Client] Screenshot RT created: " .. w .. "x" .. h)
+
     UI.Init({
         fonts = {
             { family = "sans", weights = {
@@ -1081,8 +1085,14 @@ function Start()
         messages_ = {}
         if messages then
             for _, msg in ipairs(messages) do
-                local isSelf = (msg.role == "user")
-                AddMessage(msg.content, isSelf)
+                -- 跳过系统消息和内部指令（不在聊天界面展示）
+                -- 旧数据中系统提示可能以 role="user" 保存，需通过内容前缀 "[" 过滤
+                local isInternal = (msg.role == "system")
+                    or (msg.role == "user" and msg.content and msg.content:sub(1, 1) == "[")
+                if not isInternal then
+                    local isSelf = (msg.role == "user")
+                    AddMessage(msg.content, isSelf)
+                end
             end
         end
         print("[Client] History loaded: " .. sessionId)
@@ -1090,6 +1100,7 @@ function Start()
 
     SubscribeToEvent("Update", "HandleUpdate")
     SubscribeToEvent("KeyDown", "HandleKeyDown")
+    SubscribeToEvent("EndRendering", "HandleEndRendering")
 
     print("=== AI女友 · " .. GF.NAME .. " 已上线 ===")
     if AI_ENABLED then
@@ -1112,6 +1123,9 @@ end
 ---@param eventData UpdateEventData
 function HandleUpdate(eventType, eventData)
     local dt = eventData["TimeStep"]:GetFloat()
+
+    -- 检查截图 RT 是否可读
+    CheckScreenshotRT()
 
     -- 回复计时器（本地回复 / TTS 播放完毕恢复）
     if replyTimer_ then
@@ -1143,6 +1157,93 @@ function HandleUpdate(eventType, eventData)
             exprRevertTimer_ = nil
             SwitchExpression("normal")
         end
+    end
+end
+
+--- 截图处理（在渲染完成后执行，确保帧缓冲有内容）
+function HandleEndRendering(eventType, eventData)
+    if not pendingScreenshot_ then return end
+    pendingScreenshot_ = false
+
+    print("[Client] EndRendering: taking screenshot via render target")
+
+    -- 方案1: 尝试 render target GetImage（绕过 WASM TakeScreenShot 限制）
+    if screenshotRT_ then
+        -- 触发一次渲染到 RT
+        local surface = screenshotRT_:GetRenderSurface()
+        surface:QueueUpdate()
+        -- 标记需要在下一帧读取
+        screenshotReadPending_ = true
+        print("[Client] RT update queued, will read next frame")
+        return
+    end
+
+    -- 兜底: 直接尝试 TakeScreenShot（可能失败）
+    local image = Image()
+    local ok = graphics:TakeScreenShot(image)
+    print("[Client] TakeScreenShot returned: " .. tostring(ok))
+    if not ok or image:GetWidth() == 0 then
+        AddMessage("(截图功能暂不支持)", false)
+        return
+    end
+    SaveAndSendScreenshot(image)
+end
+
+--- 在 Update 中检查 RT 是否可读
+function CheckScreenshotRT()
+    if not screenshotReadPending_ then return end
+    screenshotReadPending_ = false
+
+    print("[Client] Reading image from render target...")
+    local image = screenshotRT_:GetImage()
+    if image == nil then
+        print("[Client] GetImage returned nil")
+        AddMessage("(截图失败：无法读取渲染纹理)", false)
+        return
+    end
+    print("[Client] RT Image size: " .. image:GetWidth() .. "x" .. image:GetHeight())
+    if image:GetWidth() == 0 or image:GetHeight() == 0 then
+        print("[Client] RT Image is zero-sized")
+        AddMessage("(截图失败：渲染纹理为空)", false)
+        return
+    end
+    SaveAndSendScreenshot(image)
+end
+
+--- 保存图片并发送
+function SaveAndSendScreenshot(image)
+    -- 缩小图片以减少 base64 体积（视觉模型不需要全分辨率）
+    local maxDim = 512
+    local iw, ih = image:GetWidth(), image:GetHeight()
+    if iw > maxDim or ih > maxDim then
+        local scale = maxDim / math.max(iw, ih)
+        local nw = math.floor(iw * scale)
+        local nh = math.floor(ih * scale)
+        image:Resize(nw, nh)
+        print("[Client] Resized to " .. nw .. "x" .. nh)
+    end
+
+    local tempScreenshot = "screenshot_temp.png"
+    image:SavePNG(tempScreenshot)
+
+    if fileSystem:FileExists(tempScreenshot) then
+        local file = File(tempScreenshot, FILE_READ)
+        if file:IsOpen() then
+            local raw = file:ReadString()
+            file:Close()
+            if raw and #raw > 0 then
+                local b64 = Base64.encode(raw)
+                ClientNet.SendImage(b64, "看看我的屏幕~")
+                AddMessage("[已发送截图]", true)
+                ShowTyping(true)
+            else
+                AddMessage("(截图读取失败)", false)
+            end
+        else
+            AddMessage("(截图文件打开失败)", false)
+        end
+    else
+        AddMessage("(截图文件未生成)", false)
     end
 end
 

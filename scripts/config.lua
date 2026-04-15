@@ -11,13 +11,14 @@ return {
         MAX_TOKENS = 512,
     },
 
-    -- ==================== TTS 语音合成 ====================
+    -- ==================== TTS 语音合成（百炼 DashScope CosyVoice）====================
     TTS = {
         ENABLED  = false,
-        API_URL  = "https://openspeech.bytedance.com/api/v1/tts",
-        API_KEY  = "YOUR_TTS_API_KEY_HERE",
-        VOICE    = "zh_female_cancan",
-        FORMAT   = "wav",  -- wav / ogg (Urho3D 支持的格式)
+        API_URL  = "https://dashscope.aliyuncs.com/compatible-mode/v1/audio/speech",
+        API_KEY  = "sk-37f1402d9b4f46eeb3487a0227398a09",
+        MODEL    = "cosyvoice-v3.5-flash",
+        VOICE    = "Maia",
+        FORMAT   = "wav",  -- wav / mp3 / pcm / opus
     },
 
     -- ==================== ASR 语音识别 ====================
@@ -27,12 +28,13 @@ return {
         API_KEY  = "YOUR_ASR_API_KEY_HERE",
     },
 
-    -- ==================== 视觉模型（多模态 LLM）====================
+    -- ==================== 视觉模型（DashScope qwen3.5-flash 图片理解）====================
+    -- 两步架构：DashScope 分析图片 → 文字描述 → 交给豆包 LLM 对话
     VISION = {
-        ENABLED  = false,
-        API_URL  = "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
-        API_KEY  = "YOUR_API_KEY_HERE",
-        MODEL    = "YOUR_VISION_MODEL_ID_HERE",
+        ENABLED  = true,
+        API_URL  = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        API_KEY  = "sk-37f1402d9b4f46eeb3487a0227398a09",
+        MODEL    = "qwen3.5-flash",
     },
 
     -- ==================== AI 行为 ====================
@@ -64,9 +66,9 @@ return {
         },
     },
 
-    -- ==================== 历史持久化 ====================
+    -- ==================== 历史持久化（serverCloud）====================
     HISTORY = {
-        SAVE_DIR    = "data/chat_history",
-        AUTO_SAVE   = true,
+        AUTO_SAVE    = true,       -- 自动持久化到 serverCloud
+        MAX_SESSIONS = 50,         -- 保留最近 N 个会话的元数据
     },
 }
